@@ -2519,3 +2519,61 @@ class TestCountTokensEndpoint:
         assert data["input_tokens"] > 0
         
         print("✅ max_tokens is NOT required for count_tokens")
+
+
+
+# =============================================================================
+# Runtime end-to-end test: Opus "system-in-array" payload through the live app
+#
+# Exercises the full ASGI stack (auth -> Pydantic request validation -> handler)
+# via TestClient, proving the previously-422 payload now succeeds at runtime.
+# Uses /v1/messages/count_tokens because it runs entirely locally (no Kiro
+# upstream call needed), so it is a clean validation-gate proof.
+# =============================================================================
+
+class TestOpusSystemInArrayRuntime:
+    """Runtime proof that role='system' inside messages no longer 422s."""
+
+    OPUS_PAYLOAD = {
+        "model": "claude-opus-4.5",
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "You are concise."},
+        ],
+    }
+
+    def test_system_in_array_no_longer_422_at_runtime(self, test_client, valid_proxy_api_key):
+        """
+        What it does: POSTs the exact Opus 'system-in-array' shape to the live app.
+        Purpose: Confirm the reported 422 is gone end-to-end (not just at model level).
+        """
+        print("Action: POST /v1/messages/count_tokens with system-role message in array...")
+        response = test_client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-api-key": valid_proxy_api_key},
+            json=self.OPUS_PAYLOAD,
+        )
+        print(f"Status: {response.status_code}")
+        # The bug produced HTTP 422 here. It must now succeed.
+        assert response.status_code == 200
+        assert "input_tokens" in response.json()
+
+    def test_hoisted_system_is_actually_counted(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Confirms the hoisted system text contributes to the token count.
+        Purpose: Prove the system content was preserved (hoisted), not silently dropped.
+        """
+        with_system = test_client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-api-key": valid_proxy_api_key},
+            json=self.OPUS_PAYLOAD,
+        ).json()["input_tokens"]
+
+        without_system = test_client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={"model": "claude-opus-4.5", "messages": [{"role": "user", "content": "Hello"}]},
+        ).json()["input_tokens"]
+
+        print(f"input_tokens with hoisted system={with_system}, without={without_system}")
+        assert with_system > without_system
