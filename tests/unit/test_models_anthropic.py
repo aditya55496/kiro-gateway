@@ -1757,3 +1757,101 @@ class TestThinkingParameter:
         print(f"Comparing thinking: got={request.thinking}")
         assert request.thinking is not None
         assert request.thinking["type"] == "disabled"
+
+
+
+# ==================================================================================================
+# Tests for system-role message hoisting (Claude Code / Opus compatibility)
+#
+# Regression coverage: Claude Code (targeting Opus models) places a message with
+# role="system" inside the messages array. Anthropic expects system prompts in the
+# top-level `system` field, so the strict role Literal previously produced a 422:
+#   messages.1.role -> Input should be 'user' or 'assistant' (input='system')
+# These tests verify the system content is hoisted into `system` instead of failing.
+# ==================================================================================================
+
+class TestSystemRoleHoisting:
+    """Tests for hoisting role='system' messages into the top-level system field."""
+
+    def test_system_message_in_array_is_hoisted(self):
+        """
+        What it does: A role='system' entry inside messages is moved to `system`.
+        Purpose: Reproduce and fix the Claude Code + Opus 422 validation error.
+        """
+        req = AnthropicMessagesRequest(
+            model="claude-opus-4.5",
+            max_tokens=1024,
+            messages=[
+                {"role": "user", "content": "Hello"},
+                {"role": "system", "content": "You are a helpful assistant."},
+            ],
+        )
+        # System message removed from the array, only the user message remains.
+        assert [m.role for m in req.messages] == ["user"]
+        assert req.system == "You are a helpful assistant."
+
+    def test_hoisted_system_merges_with_existing_string_system(self):
+        """
+        What it does: Hoisted system text is appended to an existing string system.
+        Purpose: Avoid discarding a legitimately-provided top-level system prompt.
+        """
+        req = AnthropicMessagesRequest(
+            model="claude-opus-4.5",
+            max_tokens=1024,
+            system="Top-level system.",
+            messages=[
+                {"role": "system", "content": "Injected system."},
+                {"role": "user", "content": "Hi"},
+            ],
+        )
+        assert req.system == "Top-level system.\n\nInjected system."
+        assert [m.role for m in req.messages] == ["user"]
+
+    def test_hoisted_system_appends_to_existing_list_system(self):
+        """
+        What it does: Hoisted text becomes an extra block when system is a list.
+        Purpose: Preserve prompt-caching (cache_control) blocks already present.
+        """
+        req = AnthropicMessagesRequest(
+            model="claude-opus-4.5",
+            max_tokens=1024,
+            system=[{"type": "text", "text": "Cached.", "cache_control": {"type": "ephemeral"}}],
+            messages=[
+                {"role": "system", "content": [{"type": "text", "text": "Extra system."}]},
+                {"role": "user", "content": "Hi"},
+            ],
+        )
+        assert isinstance(req.system, list)
+        assert len(req.system) == 2
+        assert req.system[0].text == "Cached."
+        assert req.system[0].cache_control == {"type": "ephemeral"}
+        assert req.system[1].text == "Extra system."
+
+    def test_normal_request_is_unaffected(self):
+        """
+        What it does: A request with no system-role messages is left unchanged.
+        Purpose: Ensure the fix is a no-op for the common path (Sonnet/Haiku).
+        """
+        req = AnthropicMessagesRequest(
+            model="claude-sonnet-4.6",
+            max_tokens=1024,
+            system="Be concise.",
+            messages=[{"role": "user", "content": "Hello"}],
+        )
+        assert req.system == "Be concise."
+        assert [m.role for m in req.messages] == ["user"]
+
+    def test_genuinely_invalid_role_still_rejected(self):
+        """
+        What it does: A typo role (not user/assistant/system) still raises 422.
+        Purpose: Keep strict validation for genuinely malformed requests.
+        """
+        with pytest.raises(ValidationError):
+            AnthropicMessagesRequest(
+                model="claude-opus-4.5",
+                max_tokens=1024,
+                messages=[
+                    {"role": "user", "content": "Hello"},
+                    {"role": "invalid_role", "content": "Nope"},
+                ],
+            )

@@ -294,6 +294,123 @@ class SystemContentBlock(BaseModel):
 SystemPrompt = Union[str, List[SystemContentBlock], List[Dict[str, Any]]]
 
 
+def _extract_text_from_message_content(content: Any) -> str:
+    """
+    Extract plain text from an Anthropic message ``content`` value.
+
+    The content may be a plain string or a list of content blocks (dicts).
+    Only text blocks contribute to the extracted string; non-text blocks
+    (images, tool_use, etc.) are ignored because they cannot live in the
+    top-level ``system`` field.
+
+    Args:
+        content: Raw message content (string, list of blocks, or None)
+
+    Returns:
+        Concatenated text content (empty string if nothing extractable)
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text" or "text" in block:
+                    text = block.get("text", "")
+                    if text:
+                        parts.append(text)
+            elif hasattr(block, "text"):
+                text = getattr(block, "text", "")
+                if text:
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content)
+
+
+def normalize_request_message_roles(values: Any) -> Any:
+    """
+    Hoist ``system``-role messages out of an incoming Anthropic request.
+
+    The Anthropic Messages API only permits ``user`` and ``assistant`` roles
+    inside the ``messages`` array; the system prompt must be supplied via the
+    top-level ``system`` field. However, some clients (notably Claude Code when
+    targeting Opus models) place an entry with ``role="system"`` *inside* the
+    ``messages`` array. Because ``AnthropicMessage.role`` is a strict
+    ``Literal["user", "assistant"]``, such a request previously failed Pydantic
+    validation with HTTP 422 before any conversion logic ran:
+
+        messages.1.role -> Input should be 'user' or 'assistant' (input='system')
+
+    This helper makes the gateway tolerant of that one specific, legitimate case
+    (mirroring how the OpenAI side treats system messages): ``role == "system"``
+    entries are removed from ``messages`` and their text content is hoisted into
+    the top-level ``system`` field, preserving any existing system prompt and
+    prompt-caching blocks.
+
+    Any *other* unexpected role (e.g. a typo like ``"invalid_role"``) is left
+    untouched so it still fails strict validation with a clear 422 error.
+
+    Runs as a ``mode="before"`` validator, so ``values`` is the raw input dict.
+
+    Args:
+        values: Raw request payload (dict) prior to field validation
+
+    Returns:
+        The (possibly modified) payload
+    """
+    if not isinstance(values, dict):
+        return values
+
+    messages = values.get("messages")
+    if not isinstance(messages, list):
+        return values
+
+    hoisted_system_parts: List[str] = []
+    cleaned_messages: List[Any] = []
+    found_system = False
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            cleaned_messages.append(msg)
+            continue
+
+        role = msg.get("role")
+
+        # Hoist system-role messages into the top-level `system` field.
+        if isinstance(role, str) and role.lower() == "system":
+            text = _extract_text_from_message_content(msg.get("content"))
+            if text:
+                hoisted_system_parts.append(text)
+            found_system = True
+            continue  # drop from messages array
+
+        cleaned_messages.append(msg)
+
+    # Only mutate the payload if we actually found system messages to hoist.
+    # All other roles (including invalid ones) are passed through unchanged so
+    # genuine validation errors are still surfaced.
+    if not found_system:
+        return values
+
+    if hoisted_system_parts:
+        hoisted_text = "\n\n".join(hoisted_system_parts)
+        existing = values.get("system")
+        if existing is None or existing == "":
+            values["system"] = hoisted_text
+        elif isinstance(existing, str):
+            values["system"] = f"{existing}\n\n{hoisted_text}"
+        elif isinstance(existing, list):
+            # Preserve existing (possibly cache-controlled) blocks, append hoisted text.
+            values["system"] = existing + [{"type": "text", "text": hoisted_text}]
+        else:
+            values["system"] = hoisted_text
+
+    values["messages"] = cleaned_messages
+    return values
+
+
 class AnthropicMessagesRequest(BaseModel):
     """
     Request to Anthropic Messages API (/v1/messages).
@@ -339,6 +456,17 @@ class AnthropicMessagesRequest(BaseModel):
 
     model_config = {"extra": "allow"}
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_roles(cls, values: Any) -> Any:
+        """Hoist system-role messages into the top-level `system` field.
+
+        See ``normalize_request_message_roles`` for the full rationale. This
+        prevents a 422 when clients (e.g. Claude Code with Opus) put a
+        ``role="system"`` entry inside the messages array.
+        """
+        return normalize_request_message_roles(values)
+
 
 class AnthropicCountTokensRequest(BaseModel):
     """
@@ -362,6 +490,12 @@ class AnthropicCountTokensRequest(BaseModel):
     tools: Optional[List[AnthropicTool]] = None
     
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_roles(cls, values: Any) -> Any:
+        """Apply the same system-role hoisting as AnthropicMessagesRequest."""
+        return normalize_request_message_roles(values)
 
 
 # ==================================================================================================
